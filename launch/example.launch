@@ -4,10 +4,9 @@
     <!-- <node name="uvdar_multirobot_simulator" pkg="uvdar_multirobot_simulator" type="uvdar_sim" output="screen" launch-prefix="debug_roslaunch"> -1-> -->
       <rosparam param="target_name_list"> ["uav1","uav2","uav3","uav4","uav5"] </rosparam>
       <rosparam param="observer_name_list"> ["uav1","uav2","uav3","uav4","uav5"] </rosparam>
-
       <param name="ground_truth_topic" type="string" value="/multirotor_simulator/%s/odom"/>
       <param name="uvdar_topic" type="string" value="/%s/uvdar/measuredPoses"/>
-        
+      <!-- <param name="uav_name" value= "$UAV_NAME/"/> -->
       <param name="output_frame" type="string" value="world_origin"/>
         
       <param name="uvdar_rate" type="double" value="10.0"/>

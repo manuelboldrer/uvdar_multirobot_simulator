@@ -7,6 +7,7 @@
 #include <mrs_lib/transformer.h>
 #include <mrs_lib/param_loader.h>
 
+#include <visualization_msgs/MarkerArray.h>
 #include <random>
 
 #define sqr(X) ((X) * (X))
@@ -15,479 +16,468 @@ namespace e = Eigen;
 
 namespace Eigen
 {
-  typedef Matrix< double, 6, 6 > 	Matrix6d;
+typedef Matrix<double, 6, 6> Matrix6d;
 }
 
-namespace uvdar {
+namespace uvdar
+{
 
-  struct NodeReferrer {
-    std::string name;
-    int index = -1;
-    int ID = -1;
-  };
-  struct NodePose {
-    std::string name;
-    nav_msgs::Odometry pose;
-    bool initialized=false;
-  };
+struct NodeReferrer
+{
+  std::string name;
+  int         index = -1;
+  int         ID    = -1;
+};
+struct NodePose
+{
+  std::string        name;
+  nav_msgs::Odometry pose;
+  bool               initialized = false;
+};
 
-  struct NormalRandomVariable
-  {
-    NormalRandomVariable(Eigen::MatrixXd const& covar)
-      : NormalRandomVariable(Eigen::VectorXd::Zero(covar.rows()), covar)
-    {}
+struct NormalRandomVariable
+{
+  NormalRandomVariable(Eigen::MatrixXd const& covar) : NormalRandomVariable(Eigen::VectorXd::Zero(covar.rows()), covar) {
+  }
 
-    NormalRandomVariable(Eigen::VectorXd const& mean, Eigen::MatrixXd const& covar)
-      : mean(mean)
-    {
-      Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigenSolver(covar);
-      transform = eigenSolver.eigenvectors() * eigenSolver.eigenvalues().cwiseSqrt().asDiagonal();
+  NormalRandomVariable(Eigen::VectorXd const& mean, Eigen::MatrixXd const& covar) : mean(mean) {
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigenSolver(covar);
+    transform = eigenSolver.eigenvectors() * eigenSolver.eigenvalues().cwiseSqrt().asDiagonal();
+  }
+
+  Eigen::VectorXd mean;
+  Eigen::MatrixXd transform;
+
+  Eigen::VectorXd operator()() const {
+    static std::mt19937               gen{std::random_device{}()};
+    static std::normal_distribution<> dist;
+
+    return mean + transform * Eigen::VectorXd{mean.size()}.unaryExpr([&]([[maybe_unused]] auto x) { return dist(gen); });
+  }
+};
+
+struct UniformSpheroidRandomVariable
+{
+  UniformSpheroidRandomVariable(Eigen::MatrixXd const& covar) : UniformSpheroidRandomVariable(Eigen::VectorXd::Zero(covar.rows()), covar) {
+  }
+
+  UniformSpheroidRandomVariable(Eigen::VectorXd const& mean, Eigen::MatrixXd const& covar) : mean(mean) {
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigenSolver(covar);
+    transform = eigenSolver.eigenvectors() * eigenSolver.eigenvalues().cwiseSqrt().asDiagonal();
+  }
+
+  Eigen::VectorXd mean;
+  Eigen::MatrixXd transform;
+
+  Eigen::VectorXd operator()() const {
+    static std::mt19937                     gen{std::random_device{}()};
+    static std::uniform_real_distribution<> dist(-1, 1);
+
+    e::VectorXd candidate;
+    bool        found = false;
+    while (!found) {  // get uniform value inside a unit sphere first, should be quick (volume of inscribed sphere is approx. 0.52 of the cube)
+      candidate = Eigen::VectorXd{mean.size()}.unaryExpr([&]([[maybe_unused]] auto x) { return dist(gen); });
+      if (candidate.norm() < 1.0)
+        found = true;
+    }
+    return mean + transform * candidate;
+  }
+};
+
+class UVDARMultirobotSimulator {
+private:
+  // TODO: mutex these
+  std::vector<NodeReferrer> _targets_;
+  std::vector<NodeReferrer> _observers_;
+
+  std::vector<NodePose> _node_poses_;
+
+  std::vector<std::pair<double, double>> obstacle_positions;
+  std::string                            _ground_truth_topic_;
+  std::string                            _uvdar_topic_;
+
+  std::string          _output_frame_;
+  std::mutex           transformer_mutex;
+  mrs_lib::Transformer transformer_;
+
+  std::vector<ros::Subscriber> sub_positions_;
+  std::vector<ros::Subscriber> sub_obstacles_;
+  std::vector<NodePose>        node_poses_;
+
+  std::vector<ros::Publisher> pub_uvdar_estimate_;
+
+  double                  _uvdar_rate_;
+  std::vector<ros::Timer> uvdar_rate_timer_;
+
+public:
+  using node_callback_t = boost::function<void(const nav_msgs::OdometryConstPtr& msg)>;
+  std::string _uav_name_;
+
+
+  std::vector<std::pair<double, double>> obstacles_;
+  void                                   obstaclesCallback(const visualization_msgs::MarkerArray::ConstPtr& marker_array_msg);
+  /**
+   * @brief Constructor - loads parameters and initializes necessary structures
+   *
+   * @param nh Private NodeHandle of this ROS node
+   */
+  /* Constructor //{ */
+  UVDARMultirobotSimulator(ros::NodeHandle& nh) {
+    mrs_lib::ParamLoader param_loader(nh, "UVDARMultirobotSimulator");
+
+    /* param_loader.loadParam("uav_name", _uav_name_); */
+    std::vector<std::string> _target_name_list, _observer_name_list;
+    param_loader.loadParam("target_name_list", _target_name_list, _target_name_list);
+    if (_target_name_list.empty()) {
+      ROS_ERROR("[UVDARMultirobotSimulator]: No target names were supplied!");
+      return;
+    }
+    param_loader.loadParam("observer_name_list", _observer_name_list, _observer_name_list);
+    if (_observer_name_list.empty()) {
+      ROS_ERROR("[UVDARMultirobotSimulator]: No observer names were supplied!");
+      return;
     }
 
-    Eigen::VectorXd mean;
-    Eigen::MatrixXd transform;
+    // create structures for holding poses of nodes and for referring to them from a list of observers and targets
+    for (auto& n : _target_name_list) {
+      int ID = getID(n);
 
-    Eigen::VectorXd operator()() const
-    {
-      static std::mt19937 gen{ std::random_device{}() };
-      static std::normal_distribution<> dist;
-
-      return mean + transform * Eigen::VectorXd{ mean.size() }.unaryExpr([&]([[maybe_unused]] auto x) { return dist(gen); });
-    }
-  };
-
-  struct UniformSpheroidRandomVariable
-  {
-    UniformSpheroidRandomVariable(Eigen::MatrixXd const& covar)
-      : UniformSpheroidRandomVariable(Eigen::VectorXd::Zero(covar.rows()), covar)
-    {}
-
-    UniformSpheroidRandomVariable(Eigen::VectorXd const& mean, Eigen::MatrixXd const& covar)
-      : mean(mean)
-    {
-      Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigenSolver(covar);
-      transform = eigenSolver.eigenvectors() * eigenSolver.eigenvalues().cwiseSqrt().asDiagonal();
-    }
-
-    Eigen::VectorXd mean;
-    Eigen::MatrixXd transform;
-
-    Eigen::VectorXd operator()() const
-    {
-      static std::mt19937 gen{ std::random_device{}() };
-      static std::uniform_real_distribution<> dist(-1,1);
-
-      e::VectorXd candidate;
-      bool found = false;
-      while (!found){ // get uniform value inside a unit sphere first, should be quick (volume of inscribed sphere is approx. 0.52 of the cube)
-        candidate = Eigen::VectorXd{ mean.size() }.unaryExpr([&]([[maybe_unused]] auto x) { return dist(gen); });
-        if (candidate.norm() < 1.0)
-          found = true;
+      auto is_named = [n](const NodePose& np) -> bool { return np.name == n; };
+      if (auto it = std::find_if(begin(_node_poses_), end(_node_poses_), is_named); it != std::end(_node_poses_)) {
+        _targets_.push_back({.name = n, .index = (int)(it - _node_poses_.begin()), .ID = ID});
+      } else {
+        _node_poses_.push_back({.name = n, .pose = nav_msgs::Odometry(), .initialized = false});
+        _targets_.push_back({.name = n, .index = (int)(_node_poses_.size() - 1), .ID = ID});
       }
-      return mean + transform * candidate;
     }
-  };
+    for (auto& n : _observer_name_list) {
+      auto is_named = [n](const NodePose& np) -> bool { return np.name == n; };
+      if (auto it = std::find_if(begin(_node_poses_), end(_node_poses_), is_named); it != std::end(_node_poses_)) {
+        _observers_.push_back({.name = n, .index = (int)(it - _node_poses_.begin())});
+      } else {
+        _node_poses_.push_back({.name = n, .pose = nav_msgs::Odometry(), .initialized = false});
+        _observers_.push_back({.name = n, .index = (int)(_node_poses_.size() - 1)});
+      }
+    }
 
-  class UVDARMultirobotSimulator {
-    private: 
-      //TODO: mutex these
-      std::vector<NodeReferrer> _targets_;
-      std::vector<NodeReferrer> _observers_;
+    param_loader.loadParam("ground_truth_topic", _ground_truth_topic_, std::string());
+    param_loader.loadParam("uvdar_topic", _uvdar_topic_, std::string());
 
-      std::vector<NodePose> _node_poses_;
-      std::string _ground_truth_topic_;
-      std::string _uvdar_topic_;
 
-      std::string _output_frame_;
-      std::mutex transformer_mutex;
-      mrs_lib::Transformer transformer_;
+    for (unsigned int i = 0; i < (unsigned int)(_node_poses_.size()); i++) {
 
-      std::vector<ros::Subscriber> sub_positions_;
-      std::vector<NodePose> node_poses_;
+      auto size = std::snprintf(nullptr, 0, _ground_truth_topic_.c_str(), _node_poses_[i].name.c_str());
+      char topic_raw[size + 1];
+      std::sprintf(topic_raw, _ground_truth_topic_.c_str(), _node_poses_[i].name.c_str());
+      std::string topic = topic_raw;
 
-      std::vector<ros::Publisher> pub_uvdar_estimate_;
+      node_callback_t callback = [node_index = i, this](const nav_msgs::OdometryConstPtr& msg) { ProcessPosition(msg, node_index); };
+      ROS_INFO_STREAM("[UVDARMultirobotSimulator]: Subscribing to " << topic << ".");
+      sub_positions_.push_back(nh.subscribe(topic, 1, callback));
+    }
+    /* std::cout <<"ciao "<< _uav_name_ << std::endl; */
+    // TODO: it should be different for each uav. (uav1,uav2,uav3...)
+    sub_obstacles_.push_back(
+        nh.subscribe<visualization_msgs::MarkerArray>("/uav1/rbl_controller/obstacles_vis", 1, &UVDARMultirobotSimulator::obstaclesCallback, this));
+    param_loader.loadParam("output_frame", _output_frame_, std::string("local_origin"));
 
-      double _uvdar_rate_;
-      std::vector<ros::Timer> uvdar_rate_timer_;
-    public:
-      using node_callback_t = boost::function<void (const nav_msgs::OdometryConstPtr& msg)>;
+    param_loader.loadParam("uvdar_rate", _uvdar_rate_, double(-1.0));
 
-      /**
-       * @brief Constructor - loads parameters and initializes necessary structures
-       *
-       * @param nh Private NodeHandle of this ROS node
-       */
-      /* Constructor //{ */
-      UVDARMultirobotSimulator(ros::NodeHandle& nh) {
-        mrs_lib::ParamLoader param_loader(nh, "UVDARMultirobotSimulator");
+    for (unsigned int i = 0; i < (unsigned int)(_observers_.size()); i++) {
+      auto size = std::snprintf(nullptr, 0, _uvdar_topic_.c_str(), _observers_[i].name.c_str());
+      char topic_raw[size + 1];
+      std::sprintf(topic_raw, _uvdar_topic_.c_str(), _observers_[i].name.c_str());
+      std::string topic = topic_raw;
 
-        std::vector<std::string> _target_name_list, _observer_name_list;
-        param_loader.loadParam("target_name_list", _target_name_list, _target_name_list);
-        if (_target_name_list.empty()) {
-          ROS_ERROR("[UVDARMultirobotSimulator]: No target names were supplied!");
+      ROS_INFO_STREAM("[UVDARMultirobotSimulator]: Advertising measured poses from observer " << _observers_[i].name << ".");
+      pub_uvdar_estimate_.push_back(nh.advertise<mrs_msgs::PoseWithCovarianceArrayStamped>(topic, 1));
+      uvdar_rate_timer_.push_back(
+          nh.createTimer(ros::Rate(_uvdar_rate_).expectedCycleTime(), boost::bind(&UVDARMultirobotSimulator::ProduceEstimate, this, _1, i), false, true));
+    }
+
+
+    transformer_ = mrs_lib::Transformer("UVDARPoseCalculator");
+  }
+  //}
+
+
+  /**
+   * @brief Callback to process current position of UAVs (nodes)
+   *
+   * @param msg The input message - odometry of a given node
+   * @param node_index The index of the node from a list
+   */
+  /* ProcessPosition //{ */
+  void ProcessPosition(const nav_msgs::OdometryConstPtr& msg, size_t node_index) {
+    _node_poses_[node_index].pose        = *msg;
+    _node_poses_[node_index].initialized = true;
+    return;
+  }
+  //}
+
+  /**
+   * @brief Timer callback for producing UVDAR estimates from a given observer
+   *
+   * @param msg The input message - odometry of a given node
+   * @param node_index The index of the node from a list
+   */
+  /* ProduceEstimate //{ */
+  void ProduceEstimate([[maybe_unused]] const ros::TimerEvent& te, int observer_index) {
+    if (!(_node_poses_[_observers_[observer_index].index].initialized)) {
+      ROS_INFO_STREAM("[UVDARMultirobotSimulator]: Pose of observer " << _observers_[observer_index].name << " not yet initialized...");
+      return;
+    }
+    /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: Observer: " << _observers_[observer_index].name); */
+
+    mrs_msgs::PoseWithCovarianceArrayStamped msg;
+    msg.header.stamp    = ros::Time::now();
+    msg.header.frame_id = _observers_[observer_index].name + "/" + _output_frame_;
+    for (auto& tg : _targets_) {
+      if (!(_node_poses_[tg.index].initialized)) {
+        ROS_INFO_STREAM("[UVDARMultirobotSimulator]: Pose of target " << _targets_[observer_index].name << " not yet initialized...");
+        continue;
+      }
+      if (_observers_[observer_index].name == tg.name) {  // skipping self-observation;
+        continue;
+      }
+
+      auto curr_pose = _node_poses_[tg.index];
+
+      geometry_msgs::TransformStamped world2fcu, fcu2output;
+      {
+        std::scoped_lock lock(transformer_mutex);
+        auto             world2fcu_tmp =
+            transformer_.getTransform(curr_pose.pose.header.frame_id, _observers_[observer_index].name + "/fcu", msg.header.stamp - ros::Duration(0.2));
+        if (!world2fcu_tmp) {
+          ROS_ERROR_STREAM_THROTTLE(1.0, "[UVDARMultirobotSimulator]: Could not obtain transform from " << curr_pose.pose.header.frame_id << " to "
+                                                                                                        << _observers_[observer_index].name + "/fcu"
+                                                                                                        << "!");
           return;
         }
-        param_loader.loadParam("observer_name_list", _observer_name_list, _observer_name_list);
-        if (_observer_name_list.empty()) {
-          ROS_ERROR("[UVDARMultirobotSimulator]: No observer names were supplied!");
+        world2fcu = world2fcu_tmp.value();
+
+        auto fcu2output_tmp = transformer_.getTransform(_observers_[observer_index].name + "/fcu", _observers_[observer_index].name + "/" + _output_frame_,
+                                                        msg.header.stamp - ros::Duration(0.2));
+        if (!fcu2output_tmp) {
+          ROS_ERROR_STREAM_THROTTLE(1.0, "[UVDARMultirobotSimulator]: Could not obtain transform from "
+                                             << _observers_[observer_index].name + "/fcu"
+                                             << " to " << _observers_[observer_index].name + "/" + _output_frame_ << "!");
           return;
         }
-
-        //create structures for holding poses of nodes and for referring to them from a list of observers and targets
-        for (auto &n : _target_name_list){
-          int ID = getID(n); 
-
-          auto is_named = [n](const NodePose &np) -> bool { return np.name == n; };
-          if (auto it = std::find_if(begin(_node_poses_), end(_node_poses_), is_named); it != std::end(_node_poses_)){
-            _targets_.push_back({.name=n, .index = (int)(it-_node_poses_.begin()),.ID=ID});
-          }
-          else{
-            _node_poses_.push_back({.name=n,.pose=nav_msgs::Odometry(),.initialized=false});
-            _targets_.push_back({.name=n, .index = (int)(_node_poses_.size()-1),.ID=ID});
-          }
-
-        }
-        for (auto &n : _observer_name_list){
-          auto is_named = [n](const NodePose &np) -> bool { return np.name == n; };
-          if (auto it = std::find_if(begin(_node_poses_), end(_node_poses_), is_named); it != std::end(_node_poses_)){
-            _observers_.push_back({.name=n, .index = (int)(it-_node_poses_.begin())});
-          }
-          else{
-            _node_poses_.push_back({.name=n,.pose=nav_msgs::Odometry(),.initialized=false});
-            _observers_.push_back({.name=n, .index = (int)(_node_poses_.size()-1)});
-          }
-
-        }
-
-        param_loader.loadParam("ground_truth_topic", _ground_truth_topic_, std::string());
-        param_loader.loadParam("uvdar_topic", _uvdar_topic_, std::string());
-
-
-        for (unsigned int i = 0; i < (unsigned int)(_node_poses_.size()); i++){
-
-          auto size = std::snprintf(nullptr, 0, _ground_truth_topic_.c_str(), _node_poses_[i].name.c_str() );
-          char topic_raw[size+1];
-          std::sprintf(topic_raw, _ground_truth_topic_.c_str(), _node_poses_[i].name.c_str() );
-          std::string topic = topic_raw;
-
-          node_callback_t callback = [node_index=i,this] (const nav_msgs::OdometryConstPtr& msg) { 
-            ProcessPosition(msg, node_index);
-          };
-          ROS_INFO_STREAM("[UVDARMultirobotSimulator]: Subscribing to " << topic << ".");
-          sub_positions_.push_back(nh.subscribe(topic, 1, callback));
-
-        }
-
-        param_loader.loadParam("output_frame", _output_frame_, std::string("local_origin"));
-
-        param_loader.loadParam("uvdar_rate", _uvdar_rate_, double(-1.0));
-
-        for (unsigned int i = 0; i < (unsigned int)(_observers_.size()); i++){
-          auto size = std::snprintf(nullptr, 0, _uvdar_topic_.c_str(), _observers_[i].name.c_str() );
-          char topic_raw[size+1];
-          std::sprintf(topic_raw, _uvdar_topic_.c_str(), _observers_[i].name.c_str() );
-          std::string topic = topic_raw;
-
-          ROS_INFO_STREAM("[UVDARMultirobotSimulator]: Advertising measured poses from observer " << _observers_[i].name << ".");
-          pub_uvdar_estimate_.push_back(nh.advertise<mrs_msgs::PoseWithCovarianceArrayStamped>(topic, 1));
-          uvdar_rate_timer_.push_back(nh.createTimer(ros::Rate(_uvdar_rate_).expectedCycleTime(), boost::bind(&UVDARMultirobotSimulator::ProduceEstimate, this, _1, i), false, true));
-        }
-
-
-
-        transformer_ = mrs_lib::Transformer("UVDARPoseCalculator");
+        fcu2output = fcu2output_tmp.value();
       }
-      //}
 
 
-      /**
-       * @brief Callback to process current position of UAVs (nodes)
-       *
-       * @param msg The input message - odometry of a given node
-       * @param node_index The index of the node from a list
-       */
-      /* ProcessPosition //{ */
-      void ProcessPosition(const nav_msgs::OdometryConstPtr& msg, size_t node_index) {
-        _node_poses_[node_index].pose = *msg;
-        _node_poses_[node_index].initialized = true;
+      geometry_msgs::PoseWithCovarianceStamped target_pose_world;
+      target_pose_world.pose   = curr_pose.pose.pose;
+      auto target_pose_fcu_tmp = transformer_.transform(target_pose_world, world2fcu);
+      if (!target_pose_fcu_tmp) {
+        ROS_ERROR_STREAM_THROTTLE(1.0, "[UVDARMultirobotSimulator]: Could not perform transform from " << curr_pose.pose.header.frame_id << " to "
+                                                                                                       << _observers_[observer_index].name + "/fcu"
+                                                                                                       << "!");
         return;
       }
-      //}
+      auto target_pose_fcu = target_pose_fcu_tmp.value();
 
-      /**
-       * @brief Timer callback for producing UVDAR estimates from a given observer
-       *
-       * @param msg The input message - odometry of a given node
-       * @param node_index The index of the node from a list
-       */
-      /* ProduceEstimate //{ */
-      void ProduceEstimate([[maybe_unused]] const ros::TimerEvent& te, int observer_index) {
-        if (!(_node_poses_[_observers_[observer_index].index].initialized)){
-          ROS_INFO_STREAM("[UVDARMultirobotSimulator]: Pose of observer " << _observers_[observer_index].name << " not yet initialized...");
-          return;
-        }
-        /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: Observer: " << _observers_[observer_index].name); */
+      /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: Target: " << tg.name); */
+      auto target_estimate_fcu_opt = generateMeasurement(target_pose_fcu);
 
-        mrs_msgs::PoseWithCovarianceArrayStamped msg;
-        msg.header.stamp = ros::Time::now();
-        msg.header.frame_id = _observers_[observer_index].name + "/" + _output_frame_;
+      if (!target_estimate_fcu_opt)
+        continue;
 
-        for (auto &tg : _targets_){
-          if (!(_node_poses_[tg.index].initialized)){
-            ROS_INFO_STREAM("[UVDARMultirobotSimulator]: Pose of target " << _targets_[observer_index].name << " not yet initialized...");
-            continue;
-          }
-          if (_observers_[observer_index].name == tg.name){//skipping self-observation;
-            continue;
-          }
+      geometry_msgs::PoseWithCovarianceStamped target_estimate_fcu = target_estimate_fcu_opt.value();
 
-          auto curr_pose = _node_poses_[tg.index];
-
-          geometry_msgs::TransformStamped world2fcu, fcu2output;
-          {
-            std::scoped_lock lock(transformer_mutex);
-            auto world2fcu_tmp = transformer_.getTransform(curr_pose.pose.header.frame_id,_observers_[observer_index].name+"/fcu", msg.header.stamp-ros::Duration(0.2));
-            if (!world2fcu_tmp){
-              ROS_ERROR_STREAM_THROTTLE(1.0,"[UVDARMultirobotSimulator]: Could not obtain transform from " << curr_pose.pose.header.frame_id << " to " <<  _observers_[observer_index].name+"/fcu" << "!");
-              return;
-            }
-            world2fcu = world2fcu_tmp.value();
-
-            auto fcu2output_tmp = transformer_.getTransform(_observers_[observer_index].name+"/fcu", _observers_[observer_index].name+"/"+_output_frame_, msg.header.stamp-ros::Duration(0.2));
-            if (!fcu2output_tmp){
-              ROS_ERROR_STREAM_THROTTLE(1.0,"[UVDARMultirobotSimulator]: Could not obtain transform from " << _observers_[observer_index].name+"/fcu"<< " to " <<  _observers_[observer_index].name+"/"+_output_frame_ << "!");
-              return;
-            }
-            fcu2output = fcu2output_tmp.value();
-          }
-
-
-          geometry_msgs::PoseWithCovarianceStamped target_pose_world;
-          target_pose_world.pose = curr_pose.pose.pose;
-          auto target_pose_fcu_tmp = transformer_.transform(target_pose_world, world2fcu);
-          if (!target_pose_fcu_tmp){
-            ROS_ERROR_STREAM_THROTTLE(1.0,"[UVDARMultirobotSimulator]: Could not perform transform from " << curr_pose.pose.header.frame_id << " to " <<  _observers_[observer_index].name+"/fcu" << "!");
-            return;
-          }
-          auto target_pose_fcu = target_pose_fcu_tmp.value();
-
-          /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: Target: " << tg.name); */
-          auto target_estimate_fcu_opt = generateMeasurement(target_pose_fcu);
-
-          if (!target_estimate_fcu_opt)
-            continue;
-
-          geometry_msgs::PoseWithCovarianceStamped target_estimate_fcu = target_estimate_fcu_opt.value();
-
-          auto target_estimate_output_tmp = transformer_.transform(target_estimate_fcu, fcu2output);
-          if (!target_estimate_output_tmp){
-            ROS_ERROR_STREAM_THROTTLE(1.0,"[UVDARMultirobotSimulator]: Could not perform transform from " << _observers_[observer_index].name+"/fcu"<< " to " <<  _observers_[observer_index].name+"/"+_output_frame_ << "!");
-            return;
-          }
-          auto target_estimate_output = target_estimate_output_tmp.value();
-
-          mrs_msgs::PoseWithCovarianceIdentified pci;
-          pci.id = tg.ID;
-          pci.pose = target_estimate_output.pose.pose;
-          pci.covariance = target_estimate_output.pose.covariance;
-
-          msg.poses.push_back(pci);
-        }
-
-
-        pub_uvdar_estimate_[observer_index].publish(msg);
-
+      auto target_estimate_output_tmp = transformer_.transform(target_estimate_fcu, fcu2output);
+      if (!target_estimate_output_tmp) {
+        ROS_ERROR_STREAM_THROTTLE(1.0, "[UVDARMultirobotSimulator]: Could not perform transform from "
+                                           << _observers_[observer_index].name + "/fcu"
+                                           << " to " << _observers_[observer_index].name + "/" + _output_frame_ << "!");
         return;
       }
-      //}
+      auto target_estimate_output = target_estimate_output_tmp.value();
 
-      //TODO make this ID more flexible
-      int getID(std::string name){
-        std::string substring = name.substr(3);//currently fixed with naming of "uav#"
-        int ID = atoi(substring.c_str());
-        return ID;
+      mrs_msgs::PoseWithCovarianceIdentified pci;
+      pci.id         = tg.ID;
+      pci.pose       = target_estimate_output.pose.pose;
+      pci.covariance = target_estimate_output.pose.covariance;
+
+      msg.poses.push_back(pci);
+    }
+
+
+    pub_uvdar_estimate_[observer_index].publish(msg);
+
+    return;
+  }
+  //}
+
+  // TODO make this ID more flexible
+  int getID(std::string name) {
+    std::string substring = name.substr(3);  // currently fixed with naming of "uav#"
+    int         ID        = atoi(substring.c_str());
+    return ID;
+  }
+
+  std::optional<geometry_msgs::PoseWithCovarianceStamped> generateMeasurement(geometry_msgs::PoseWithCovarianceStamped input) {
+    e::Vector3d    p(input.pose.pose.position.x, input.pose.pose.position.y, input.pose.pose.position.z);
+    e::Quaterniond q(input.pose.pose.orientation.w, input.pose.pose.orientation.x, input.pose.pose.orientation.y, input.pose.pose.orientation.z);
+
+    /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: p: " << p.transpose()); */
+
+    double distance = p.norm();
+
+    e::Vector3d bearing = p.normalized();
+    e::Vector3d horizontal_eigen;
+    horizontal_eigen << bearing.y(), -bearing.x(), 0;
+
+
+    e::Matrix3d eigenvectors;
+    eigenvectors << bearing, horizontal_eigen, e::Vector3d::UnitZ();
+
+    double tan_pixangle  = tan(0.004);  // pi/752 radians
+    double target_radius = 0.25;
+
+    double distance_eigenval_sqrt;
+    double width_eigenval_sqrt;
+    double height_eigenval_sqrt;
+
+    int view_marker_count = viewMarkerCount(p, q);
+    /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: the marker count is " << view_marker_count); */
+    if (view_marker_count == 3) {
+      distance_eigenval_sqrt = (0.333 + randRange(-0.3, 0.3)) * distance;
+      /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: distance_eigenval_sqrt = " << distance_eigenval_sqrt); */
+      width_eigenval_sqrt  = 3 * distance * tan_pixangle;
+      height_eigenval_sqrt = 3 * distance * tan_pixangle;
+    } else if (view_marker_count == 2) {
+      distance_eigenval_sqrt = (0.5 + randRange(-0.6, 0.6)) * distance;
+      /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: distance_eigenval_sqrt = " << distance_eigenval_sqrt); */
+      width_eigenval_sqrt  = 1.5 * target_radius;
+      height_eigenval_sqrt = 1.5 * target_radius;
+    } else if (view_marker_count == 1) {
+      // TODO - mean in the center of range
+      distance_eigenval_sqrt = 7.5;
+      width_eigenval_sqrt    = 2 * target_radius;
+      height_eigenval_sqrt   = 2 * target_radius;
+    } else {
+      return std::nullopt;
+    }
+
+    e::Matrix3d eigenvalues = e::Vector3d(sqr(distance_eigenval_sqrt), sqr(width_eigenval_sqrt), sqr(height_eigenval_sqrt)).asDiagonal();
+
+    e::Matrix3d C_pos = eigenvectors * eigenvalues * eigenvectors.transpose();
+
+
+    e::Matrix6d C             = e::Matrix6d::Zero();
+    C.topLeftCorner(3, 3)     = C_pos;
+    C.bottomRightCorner(3, 3) = sqr(0.5) * e::Matrix3d::Identity();
+
+    /* auto noise_gen = NormalRandomVariable(C); */
+    auto noise_gen = UniformSpheroidRandomVariable(C);
+
+    auto noise = noise_gen();
+
+    e::Vector3d pn;
+    if (view_marker_count > 1) {
+      pn = p + noise.topLeftCorner(3, 1);
+      /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: Multiple markers, noise is: [" << noise.topLeftCorner(3,1).transpose() << "]"); */
+    } else {
+      pn = (bearing * 7.5);  //+ 2*(noise.topLeftCorner(3,1));
+      /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: Single marker, noise is: [" << noise.topLeftCorner(3,1).transpose() << "]"); */
+    }
+    e::Vector3d    wn = noise.bottomLeftCorner(3, 1);
+    e::Quaterniond qtemp =
+        e::AngleAxisd(wn.x(), e::Vector3d::UnitX()) * e::AngleAxisd(wn.y(), e::Vector3d::UnitY()) * e::AngleAxisd(wn.z(), e::Vector3d::UnitZ());
+    e::Quaterniond qn = qtemp * q;
+
+
+    geometry_msgs::PoseWithCovarianceStamped output;
+    output.pose.pose.position.x    = pn.x();
+    output.pose.pose.position.y    = pn.y();
+    output.pose.pose.position.z    = pn.z();
+    output.pose.pose.orientation.w = qn.w();
+    output.pose.pose.orientation.x = qn.x();
+    output.pose.pose.orientation.y = qn.y();
+    output.pose.pose.orientation.z = qn.z();
+
+    for (int i = 0; i < 6; i++) {
+      for (int j = 0; j < 6; j++) {
+        output.pose.covariance[6 * j + i] = C(j, i);
       }
+    }
 
-      std::optional<geometry_msgs::PoseWithCovarianceStamped> generateMeasurement(geometry_msgs::PoseWithCovarianceStamped input){
-        e::Vector3d p(
-            input.pose.pose.position.x,
-            input.pose.pose.position.y,
-            input.pose.pose.position.z
-            );
-        e::Quaterniond q(
-            input.pose.pose.orientation.w,
-            input.pose.pose.orientation.x,
-            input.pose.pose.orientation.y,
-            input.pose.pose.orientation.z
-            );
+    return output;
+  }
 
-        /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: p: " << p.transpose()); */
+  int viewMarkerCount(e::Vector3d p, e::Quaterniond q) {
+    e::Vector3d bearing      = p.normalized();
+    e::Vector3d target_front = q * e::Vector3d::UnitX();
+    /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: bearin: " << bearing.transpose()); */
+    /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: target_front: " << target_front.transpose()); */
+    // TODO make more detailed (tilts not accounted for)
+    double relative_angle = acos(target_front.dot(bearing));
+    double remainder      = fmod(relative_angle, M_PI / 2.0);
+    /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: relative angle: " << relative_angle << ", remainder: " << remainder); */
+    // TODO this should be more random - also incorporate seeing none here as return 0.
 
-        double distance = p.norm();
-
-        e::Vector3d bearing = p.normalized();
-        e::Vector3d horizontal_eigen;
-        horizontal_eigen << bearing.y(), -bearing.x(), 0;
-
-
-        e::Matrix3d eigenvectors;
-        //TODO make more detailed (tilts not accounted for) - last two eigenvectors need to be rotated accordingly. Tilt along line of sight may also be relevant for 3-marker views
-        eigenvectors << bearing, horizontal_eigen, e::Vector3d::UnitZ();
-
-        double tan_pixangle = tan(0.004); //pi/752 radians
-        double target_radius = 0.25;
-
-        double distance_eigenval_sqrt;
-        double width_eigenval_sqrt;
-        double height_eigenval_sqrt;
-
-        int view_marker_count = viewMarkerCount(p,q);
-        /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: the marker count is " << view_marker_count); */
-        if (view_marker_count == 3){
-          distance_eigenval_sqrt = (0.1+randRange(-0.03,0.03))*distance;
-          /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: distance_eigenval_sqrt = " << distance_eigenval_sqrt); */
-          width_eigenval_sqrt = 3*distance*tan_pixangle;
-          height_eigenval_sqrt = 3*distance*tan_pixangle;
-        }
-        else if (view_marker_count == 2) {
-          distance_eigenval_sqrt = (0.2+randRange(-0.07,0.07))*distance;
-          /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: distance_eigenval_sqrt = " << distance_eigenval_sqrt); */
-            width_eigenval_sqrt = 1.5*target_radius;
-          height_eigenval_sqrt = 1.5*target_radius;
-        }
-        else if (view_marker_count == 1) {
-          distance_eigenval_sqrt = 7.5;
-          width_eigenval_sqrt = 2*target_radius;
-          height_eigenval_sqrt = 2*target_radius;
-
-          //perturb the bearing - the single visible marker may not be towards the center of the target
-          auto offset_gen = UniformSpheroidRandomVariable((e::Vector3d::Ones()*target_radius).asDiagonal());
-          auto offset = offset_gen();
-          bearing = (p+offset).normalized();
-        }
-        else {
-          return std::nullopt;
-        }
-        
-        e::Matrix3d eigenvalues = e::Vector3d(
-            sqr(distance_eigenval_sqrt),
-            sqr(width_eigenval_sqrt),
-            sqr(height_eigenval_sqrt)
-            ).asDiagonal();
-
-        e::Matrix3d C_pos = eigenvectors*eigenvalues*eigenvectors.transpose();
-
-
-
-
-
-
-
-
-        e::Matrix6d C = e::Matrix6d::Zero();
-        C.topLeftCorner(3,3) = C_pos;
-        C.bottomRightCorner(3,3) = sqr(0.5)*e::Matrix3d::Identity();
-
-        /* auto noise_gen = NormalRandomVariable(C); */
-        auto noise_gen = UniformSpheroidRandomVariable(C);
-
-        auto noise = noise_gen();
-
-        e::Vector3d pn;
-        if (view_marker_count > 1){
-          pn = p + noise.topLeftCorner(3,1);
-          /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: Multiple markers, noise is: [" << noise.topLeftCorner(3,1).transpose() << "]"); */
-        }
-        else {
-          pn = (bearing*7.5);//+ 2*(noise.topLeftCorner(3,1));
-          /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: Single marker, noise is: [" << noise.topLeftCorner(3,1).transpose() << "]"); */
-        }
-        e::Vector3d wn = noise.bottomLeftCorner(3,1);
-        e::Quaterniond qtemp =
-          e::AngleAxisd(wn.x(), e::Vector3d::UnitX()) *
-          e::AngleAxisd(wn.y(), e::Vector3d::UnitY()) *
-          e::AngleAxisd(wn.z(), e::Vector3d::UnitZ());
-        e::Quaterniond qn = qtemp*q;
-
-
-
-
-        geometry_msgs::PoseWithCovarianceStamped output;
-        output.pose.pose.position.x = pn.x();
-        output.pose.pose.position.y = pn.y();
-        output.pose.pose.position.z = pn.z();
-        output.pose.pose.orientation.w = qn.w();
-        output.pose.pose.orientation.x = qn.x();
-        output.pose.pose.orientation.y = qn.y();
-        output.pose.pose.orientation.z = qn.z();
-
-        for (int i=0; i<6; i++){
-          for (int j=0; j<6; j++){
-            output.pose.covariance[6*j+i] = C(j,i);
-          }
-        }
-
-        return output;
+    int output;
+    if (p.norm() < 9.0) {
+      if ((abs(remainder) > 0.349) && (abs(remainder) < 1.222)) {  // betwen 20 and 70 degrees
+        output = 3;
+      } else {
+        output = 2;
       }
+    } else if (p.norm() >= 10) {
+      output = 0;
+    } else {
+      output = 1;
+    }
 
-      int viewMarkerCount(e::Vector3d p, e::Quaterniond q){
-        e::Vector3d bearing = p.normalized();
-        e::Vector3d target_front = q*e::Vector3d::UnitX();
-        /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: bearin: " << bearing.transpose()); */
-        /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: target_front: " << target_front.transpose()); */
-        double relative_angle = acos(target_front.dot(bearing));
-        double remainder = fmod(relative_angle, M_PI/2.0);
-        /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: relative angle: " << relative_angle << ", remainder: " << remainder); */
-
-        int output;
-        if (p.norm() < 12.0){
-          if ((abs(remainder) > 0.349) && (abs(remainder) < 1.222)){ //betwen 20 and 70 degrees
-            output = 3;
-          }
-          else {
-            output = 2;
-          }
-        }
-        else if (p.norm() > 15){
-          output = 0;
-        }
-        else {
-          output = 1;
-        }
-
-        int init_count = output;
-        for (int i=0; i < init_count; i++){
-          if (dropMarker()){
-            output --;
-          }
-        }
-      
-        return output;
+    int init_count = output;
+    for (int i = 0; i < init_count; i++) {
+      if (dropMarker()) {
+        output--;
       }
+    }
 
-      double randRange(double minimum, double maximum){
-        static std::mt19937 gen{ std::random_device{}() };
-        static std::uniform_real_distribution<> distribution(minimum, maximum);
-        double output = distribution(gen);
-        /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: Random from " << minimum << " to " << maximum << " came out to " << output); */
-        return output;
-      }
+    return output;
+  }
 
-      bool dropMarker(){
-        static std::mt19937 gen{ std::random_device{}() };
-        static std::uniform_int_distribution<> distribution(0, 100);
-        int sample = distribution(gen);
-        return (sample <5); //percent of marker views drop one
-      }
-  };
+  double randRange(double minimum, double maximum) {
+    static std::mt19937                     gen{std::random_device{}()};
+    static std::uniform_real_distribution<> distribution(minimum, maximum);
+    double                                  output = distribution(gen);
+    /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: Random from " << minimum << " to " << maximum << " came out to " << output); */
+    return output;
+  }
 
+  bool dropMarker() {
+    static std::mt19937                    gen{std::random_device{}()};
+    static std::uniform_int_distribution<> distribution(0, 100);
+    int                                    sample = distribution(gen);
+    return (sample < 5);  // percent of marker views drop one
+  }
+};
 
-} //uvdar
+void UVDARMultirobotSimulator::obstaclesCallback(const visualization_msgs::MarkerArray::ConstPtr& marker_array_msg) {
+  // Iterate through each marker in the MarkerArray
+  obstacles_.clear();
+  for (const auto& marker : marker_array_msg->markers) {
+    // Assuming the position of the obstacle is stored in the marker's pose
+    double x = marker.pose.position.x;
+    double y = marker.pose.position.y;
+
+    // Print the x, y positions of the obstacle
+    /* ROS_INFO("Obstacle position: x = %f, y = %f", x, y); */
+    obstacles_.emplace_back(x, y);
+  }
+}
+
+}  // namespace uvdar
 
 int main(int argc, char** argv) {
   ros::init(argc, argv, "uvdar_multirobot_simulator");
 
-  ros::NodeHandle nh("~");
+  ros::NodeHandle                 nh("~");
   uvdar::UVDARMultirobotSimulator ums(nh);
   ROS_INFO("[UVDARMultirobotSimulator]: UVDAR Multirobot Simulator node initiated");
   ros::spin();

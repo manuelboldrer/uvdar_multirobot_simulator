@@ -12,6 +12,10 @@
 
 #define sqr(X) ((X) * (X))
 
+
+/* TODO: to add occlusion due to obstacles (line of sight) */
+
+
 namespace e = Eigen;
 
 namespace Eigen
@@ -344,12 +348,14 @@ public:
     int view_marker_count = viewMarkerCount(p, q);
     /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: the marker count is " << view_marker_count); */
     if (view_marker_count == 3) {
-      distance_eigenval_sqrt = (0.333 + randRange(-0.3, 0.3)) * distance;
+      /* distance_eigenval_sqrt = (0.333 + randRange(-0.3, 0.3)) * distance; */
+      distance_eigenval_sqrt = (0.1 + randRange(-0.03, 0.03)) * distance;
       /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: distance_eigenval_sqrt = " << distance_eigenval_sqrt); */
       width_eigenval_sqrt  = 3 * distance * tan_pixangle;
       height_eigenval_sqrt = 3 * distance * tan_pixangle;
     } else if (view_marker_count == 2) {
-      distance_eigenval_sqrt = (0.5 + randRange(-0.6, 0.6)) * distance;
+      /* distance_eigenval_sqrt = (0.5 + randRange(-0.6, 0.6)) * distance; */
+      distance_eigenval_sqrt = (0.2 + randRange(-0.07, 0.07)) * distance;
       /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: distance_eigenval_sqrt = " << distance_eigenval_sqrt); */
       width_eigenval_sqrt  = 1.5 * target_radius;
       height_eigenval_sqrt = 1.5 * target_radius;
@@ -420,13 +426,13 @@ public:
     // TODO this should be more random - also incorporate seeing none here as return 0.
 
     int output;
-    if (p.norm() < 9.0) {
+    if (p.norm() < 12.0) {
       if ((abs(remainder) > 0.349) && (abs(remainder) < 1.222)) {  // betwen 20 and 70 degrees
         output = 3;
       } else {
         output = 2;
       }
-    } else if (p.norm() >= 10) {
+    } else if (p.norm() >= 15) {
       output = 0;
     } else {
       output = 1;

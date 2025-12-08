@@ -349,15 +349,15 @@ public:
     /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: the marker count is " << view_marker_count); */
     if (view_marker_count == 3) {
       /* distance_eigenval_sqrt = (0.333 + randRange(-0.3, 0.3)) * distance; */
-      /* distance_eigenval_sqrt = (0.1 + randRange(-0.03, 0.03)) * distance; */
-      distance_eigenval_sqrt = (0.01 + randRange(-0.0003, 0.0003)) * distance;
+      distance_eigenval_sqrt = (0.1 + randRange(-0.03, 0.03)) * distance;
+      // distance_eigenval_sqrt = (0.01 + randRange(-0.0003, 0.0003)) * distance;
       /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: distance_eigenval_sqrt = " << distance_eigenval_sqrt); */
       width_eigenval_sqrt  = 3 * distance * tan_pixangle;
       height_eigenval_sqrt = 3 * distance * tan_pixangle;
     } else if (view_marker_count == 2) {
       /* distance_eigenval_sqrt = (0.5 + randRange(-0.6, 0.6)) * distance; */
-      /* distance_eigenval_sqrt = (0.2 + randRange(-0.07, 0.07)) * distance; */
-      distance_eigenval_sqrt = (0.01 + randRange(-0.0003, 0.0003)) * distance;
+      distance_eigenval_sqrt = (0.2 + randRange(-0.07, 0.07)) * distance;
+      // distance_eigenval_sqrt = (0.01 + randRange(-0.0003, 0.0003)) * distance;
       /* ROS_INFO_STREAM("[" << ros::this_node::getName().c_str() << "]: distance_eigenval_sqrt = " << distance_eigenval_sqrt); */
       width_eigenval_sqrt  = 1.5 * target_radius;
       height_eigenval_sqrt = 1.5 * target_radius;
@@ -433,15 +433,15 @@ public:
       if ((abs(remainder) > 0.349) && (abs(remainder) < 1.222)) {  // betwen 20 and 70 degrees
         output = 3;
       } else {
-        /* output = 2; */
-        output = 3;
+        output = 2; 
+        // output = 3;
       }
     } else if (p.norm() >= 15) {
-      /* output = 0; */
-      output = 3;
+      output = 0; 
+      // output = 3;
     } else {
-      /* output = 1; */
-      output = 3;
+      output = 1; 
+      // output = 3;
     }
 
     int init_count = output;
